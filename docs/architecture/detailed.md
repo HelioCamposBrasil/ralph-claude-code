@@ -128,3 +128,88 @@ These are project initialization scripts.
 
 -   `ralph-setup`: Creates a new, blank Ralph project with the standard directory structure and template files.
 -   `ralph-import`: Takes an existing document (e.g., a PRD in Markdown) and uses Claude Code to convert it into the `PROMPT.md` and `@fix_plan.md` files for a new project. This script is a good example of how Ralph uses AI to bootstrap its own configuration.
+
+## 6. Function-Level Breakdowns
+
+This section provides a more detailed look at the key functions within the core scripts.
+
+### 6.1. `ralph_loop.sh`
+
+-   **`main()`**
+    -   **Purpose:** The primary entry point and orchestrator of the autonomous loop.
+    -   **Logic:**
+        1.  Initializes logging and checks for the existence of `PROMPT.md`.
+        2.  Enters an infinite `while true` loop.
+        3.  Inside the loop, it increments `loop_count` and calls `init_call_tracking()` to handle the rate limit timer.
+        4.  It checks `should_halt_execution()` to see if the circuit breaker is open.
+        5.  It checks `can_make_call()` to ensure the rate limit has not been exceeded.
+        6.  It calls `should_exit_gracefully()` to check for completion conditions.
+        7.  If all checks pass, it calls `execute_claude_code()`.
+        8.  It handles the exit code from the execution, pausing or breaking the loop as needed.
+
+-   **`execute_claude_code()`**
+    -   **Purpose:** To execute the Claude Code CLI, manage its output, and analyze the results.
+    -   **Arguments:** `loop_count`
+    -   **Logic:**
+        1.  Constructs a command to run the `claude` CLI with a timeout.
+        2.  Redirects the output to a timestamped log file in `logs/`.
+        3.  While the command runs, it displays a progress indicator.
+        4.  On successful execution, it increments the API call counter.
+        5.  It then calls `analyze_response()` from the response analyzer library.
+        6.  It records the outcome (file changes, errors) with `record_loop_result()` from the circuit breaker library.
+    -   **Return Codes:** Returns `0` for success, `1` for a general failure, `2` for hitting the 5-hour API limit, and `3` if the circuit breaker trips.
+
+-   **`should_exit_gracefully()`**
+    -   **Purpose:** To determine if the project is complete and the loop should terminate.
+    -   **Logic:**
+        1.  Reads the `.exit_signals` JSON file.
+        2.  Checks for several conditions in order of precedence:
+            -   Have there been `>= 3` consecutive test-only loops?
+            -   Have there been `>= 2` consecutive "done" signals?
+            -   Are all checkboxes in `@fix_plan.md` marked as complete?
+        3.  If any condition is met, it returns a string indicating the reason for the exit (e.g., `"test_saturation"`). Otherwise, it returns an empty string.
+
+### 6.2. `lib/response_analyzer.sh`
+
+-   **`analyze_response()`**
+    -   **Purpose:** To perform a comprehensive analysis of the AI's output.
+    -   **Arguments:** `output_file`, `loop_number`
+    -   **Logic:**
+        1.  Reads the content of the `output_file`.
+        2.  Checks for structured `RALPH_STATUS` output.
+        3.  Scans for natural language completion keywords (e.g., "done," "complete").
+        4.  Determines if the loop was "test-only" by looking for test commands and a lack of implementation keywords.
+        5.  Checks for file changes using `git diff`.
+        6.  Calculates a `confidence_score` based on these signals.
+        7.  Writes all findings to a `.response_analysis` JSON file.
+
+-   **`update_exit_signals()`**
+    -   **Purpose:** To update the persistent state of exit signals based on the latest analysis.
+    -   **Logic:**
+        1.  Reads the `.response_analysis` and `.exit_signals` files.
+        2.  If the analysis indicates a test-only loop, it appends the current loop number to the `test_only_loops` array. If not, it clears the array.
+        3.  If the analysis found a completion signal, it appends the loop number to the `done_signals` array.
+        4.  It trims the signal arrays to maintain a rolling window of the last 5 loops.
+        5.  It overwrites the `.exit_signals` file with the updated JSON.
+
+### 6.3. `lib/circuit_breaker.sh`
+
+-   **`record_loop_result()`**
+    -   **Purpose:** To track the health of the development loop and decide if the circuit breaker should change state.
+    -   **Arguments:** `loop_number`, `files_changed`, `has_errors`, `output_length`
+    -   **Logic:**
+        1.  Reads the current state from `.circuit_breaker_state`.
+        2.  Determines if progress was made (i.e., if `files_changed > 0`).
+        3.  If progress was made, it resets the `consecutive_no_progress` counter. If not, it increments it.
+        4.  If `has_errors` is true, it increments the `consecutive_same_error` counter. If not, it resets it.
+        5.  It then evaluates the state transition logic:
+            -   **From `CLOSED`:** If `consecutive_no_progress >= 3` or `consecutive_same_error >= 5`, move to `OPEN`. If `consecutive_no_progress >= 2`, move to `HALF_OPEN`.
+            -   **From `HALF_OPEN`:** If progress is made, move back to `CLOSED`. If not, and the no-progress threshold is met, move to `OPEN`.
+        6.  It writes the new state back to the file and logs the transition.
+
+-   **`should_halt_execution()`**
+    -   **Purpose:** The main function called by `ralph_loop.sh` to check if the circuit is open.
+    -   **Logic:**
+        1.  Reads the current state from the `.circuit_breaker_state` file.
+        2.  If the state is `OPEN`, it prints a detailed diagnostic message to the user explaining why execution is halted and how to reset the circuit. It then returns `0` (Bash success), which signals to the main loop to halt.
+        3.  If the state is not `OPEN`, it returns `1` (Bash failure), signaling that execution can continue.
